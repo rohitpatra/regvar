@@ -14,6 +14,9 @@ from omegaconf import DictConfig
 import time
 import logging
 from tqdm import tqdm
+from typing import List, Tuple
+from torch.func import make_functional_with_buffers, jvp
+
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +174,266 @@ def model_predictions(model, dataloader):
     combined_predictions = np.concatenate(combined_predictions, axis=0)
     true_labels = np.concatenate(true_labels, axis=0)
 
+    return combined_predictions, true_labels
+
+
+def _make_u_tuples(
+    model: torch.nn.Module,
+    sketch_size: int,
+    seed: int,
+    std: float,
+    device: torch.device | str = "cpu",
+) -> List[Tuple[torch.Tensor, ...]]:
+    """
+    Create `sketch_size` tuples of per-parameter Gaussian noise.
+    Stored on `device` (default CPU) to save GPU memory.
+    """
+    names = [n for n, _ in model.named_parameters()]
+    tuples: list[Tuple[torch.Tensor, ...]] = []
+
+    gen = torch.Generator(device=device)
+    for k in range(sketch_size):
+        gen.manual_seed(seed + k)
+        u_dict = {
+            n: torch.randn(p.shape, dtype=p.dtype, device=device, generator=gen) * std
+            for n, p in model.named_parameters()
+        }
+        tuples.append(tuple(u_dict[n] for n in names))
+
+    return tuples
+
+
+@torch.no_grad()
+def sketching_predictions(
+    model_non_reg: torch.nn.Module,
+    model_reg_list: List[torch.nn.Module],
+    dataloader,
+    cfg: dict,
+    *,
+    alpha: float = 1.0,
+):
+    """
+    Memory-light version: streams one JVP per sketch to keep GPU usage low.
+    Returns (combined_predictions, true_labels) as NumPy arrays.
+    """
+    device = next(model_non_reg.parameters()).device
+
+    # put all models in eval mode
+    model_non_reg.eval()
+    for m in model_reg_list:
+        m.eval()
+
+    # make functional copy once
+    func_non_reg, params_non_reg, buffers_non_reg = make_functional_with_buffers(
+        model_non_reg
+    )
+
+    # ── sketch config ────────────────────────────────────────────────────────
+    m_cfg = cfg.model
+    sketch_size = m_cfg.right_sketch_size
+    total_params = sum(p.numel() for p in model_non_reg.parameters() if p.requires_grad)
+    target_std = (1.0 / total_params) ** 0.5 if total_params else 1.0
+    sketching_multiplier = m_cfg.sketching_multiplier
+    target_std *= sketching_multiplier
+    
+
+    # keep noise on CPU to avoid GPU OOM
+    u_tuples_cpu = _make_u_tuples(
+        model_non_reg, sketch_size, m_cfg.u_seed_init, target_std, "cpu"
+    )
+
+    # helper: functional forward that only depends on params
+    def f_params(p, inp):
+        return func_non_reg(p, buffers_non_reg, input_ids=inp).logits  # (B,C,V)
+
+    preds, lbls = [], []
+    
+    for batch in tqdm(dataloader, desc="Sketching"):
+        # dataloader gives us a dict
+        inputs = batch["input_ids"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+
+        logits_nr = model_non_reg(inputs).logits  # (B,C,V)
+
+        # stack diff over regularized models → shape (S,B,C,V)
+        logits_diff = torch.stack(
+            [logits_nr - m(inputs).logits for m in model_reg_list], dim=0
+        )
+
+        # incremental variance: start at 0
+        var_estimate = torch.zeros_like(logits_nr)  # (B,C,V)
+
+        for k, u_cpu in enumerate(u_tuples_cpu):
+            # move one noise tuple to GPU
+            u = tuple(t.to(device, non_blocking=True) for t in u_cpu)
+
+            # JVP -> (outputs, jvp_out); we keep only jvp_out
+            _, jvp_out = jvp(
+                lambda p: f_params(p, inputs),
+                (params_non_reg,),
+                (u,),
+            )
+
+            var_estimate += logits_diff[k] * jvp_out  # (B,C,V)
+
+            del jvp_out, u
+            torch.cuda.empty_cache()  # helps fragmentation on long runs
+        var_estimate_adjusted_for_sketching_multiplier = var_estimate / (sketching_multiplier**2)
+
+        f_vr = alpha * var_estimate_adjusted_for_sketching_multiplier.abs()
+        kappa = 1.0 / torch.sqrt(1.0 + np.pi / 8.0 * f_vr)
+        combined_prob = kappa * logits_nr
+
+        preds.append(combined_prob.detach().cpu().numpy())
+        lbls.append(labels.detach().cpu().numpy())
+
+        # cleanup to keep peak GPU memory usage low
+        del logits_nr, logits_diff, var_estimate, combined_prob, labels, inputs
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    return np.concatenate(preds), np.concatenate(lbls)
+
+
+def sketching_predictions_alternate(model_non_reg, model_reg_list, dataloader, cfg, alpha=1):
+    model_config = cfg.model
+    log.info(f"Starting sketching predictions with alpha={alpha}")
+    
+    # Set device
+    device = next(model_non_reg.parameters()).device
+    
+    # Ensure all models are in eval mode
+    model_non_reg.eval()
+    func_model_non_reg, params_non_reg, buffers_non_reg = make_functional_with_buffers(model_non_reg.eval())
+
+    for model_reg in model_reg_list:
+        model_reg.eval()
+    
+    combined_predictions = []
+    true_labels = []
+    
+    # Generate sketch vectors based on seed
+    u_seed_starter = model_config.u_seed_init
+    sketch_size = model_config.right_sketch_size
+    
+    # Calculate total number of trainable parameters
+    total_params = sum(p.numel() for p in model_non_reg.parameters() if p.requires_grad)
+    log.info(f"Total trainable parameters: {total_params}")
+
+    # Calculate desired standard deviation for variance = 1 / total_params
+    if total_params > 0:
+        target_std_dev = (1.0 / total_params)**0.5
+        log.info(f"Initial target standard deviation for u_eval generation: {target_std_dev}")
+    else:
+        target_std_dev = 1.0 # Avoid division by zero, fallback to std dev 1
+        log.warning("Model has no trainable parameters. Using std dev 1 for u_eval.")
+
+    # Apply sketching_multiplier if provided
+    sketching_multiplier = model_config.sketching_multiplier
+    if sketching_multiplier is not None:
+        target_std_dev *= sketching_multiplier
+        log.info(f"Applied sketching_multiplier {sketching_multiplier}, adjusted target_std_dev: {target_std_dev}")
+    
+    # Process batches one at a time
+    for i, batch in enumerate(tqdm(dataloader, desc="Sketching batch predictions")):
+        # Clear cache at strategic points only
+        if i % 5 == 0:  # Less frequent clearing (was 3)
+            torch.cuda.empty_cache()
+            gc.collect()
+            log.info(f"Processing batch {i}/{len(dataloader)} - Cleared CUDA cache")
+        
+        inputs, labels = batch['input_ids'].to(device), batch['labels'].to(device)
+        
+        # Compute logits differences between non-regularized and regularized models one by one
+        logits_diff_list = []
+        output_non_reg = model_non_reg(inputs)
+        logits_non_reg = output_non_reg.logits
+        
+        for model_reg in model_reg_list:
+            outputs_reg = model_reg(inputs)
+            logits_reg = outputs_reg.logits
+            logits_diff = logits_non_reg - logits_reg
+            logits_diff_list.append(logits_diff)
+            # Free memory of individual model outputs
+            del logits_reg, outputs_reg
+        
+        # Stack the differences into a single tensor [sketch_size, batch_size, seq_len, vocab_size]
+        logits_diff_tensor = torch.stack(logits_diff_list, dim=0)
+        # Free memory of the list but not the tensor we just created
+        del logits_diff_list
+        
+        jvp_out_list = []
+        # Compute the JVPs for each sketch
+        # helper that only depends on params
+        def f_params(p):
+            return func_model_non_reg(p, buffers_non_reg, input_ids=inputs).logits     # (B, Context, V)
+        
+        # Only clear cache once before the memory-intensive JVP calculations
+        torch.cuda.empty_cache()
+        
+        for sketch_number in range(sketch_size):
+            u_local_seed = u_seed_starter + sketch_number
+            log.info(f"Setting torch seed to {u_local_seed} for reproducible u_eval generation for sketch number {sketch_number}")
+            torch.manual_seed(u_local_seed)
+            
+            # Generate random noise vector u_eval for each parameter with same shape
+            u_eval = {}
+            for name, param in model_non_reg.named_parameters():
+                # Generate standard normal noise and scale it by the target standard deviation
+                u_eval[name] = (torch.randn_like(param) * target_std_dev).to(device)
+            u_tuple = tuple(u_eval[n] for n, _ in model_non_reg.named_parameters())
+            # compute corresponding jvp
+            _, jvp_out = jvp(f_params, (params_non_reg,), (u_tuple,))
+            # jvp_out is of shape [batch_size, seq_len, vocab_size]
+            jvp_out_list.append(jvp_out)
+            # Clean up u_eval to save memory
+            del u_eval, u_tuple
+            
+            # Only clear cache periodically during JVP calculations if needed
+            if sketch_number > 0 and sketch_number % (sketch_size // 2) == 0:
+                torch.cuda.empty_cache()
+        
+        # Stack all JVP outputs
+        jvp_out_tensor = torch.stack(jvp_out_list, dim=0)
+        # Free memory
+        del jvp_out_list
+        
+        # Log memory usage for debugging
+        log.info(f"GPU memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
+        log.info(f"GPU memory reserved: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
+        
+        # Using einsum for more explicit dimension handling
+        var_estimate = torch.einsum('sbcv,sbcv->bcv', logits_diff_tensor, jvp_out_tensor)
+        var_estimate_adjusted_for_sketching_multiplier = var_estimate / (sketching_multiplier**2)
+
+        
+        # Free memory of tensors no longer needed
+        del logits_diff_tensor, jvp_out_tensor
+        
+        f_vr = alpha * torch.abs(var_estimate_adjusted_for_sketching_multiplier)
+        kappa = 1 / torch.sqrt(1. + np.pi / 8 * f_vr)
+        combined_prob = kappa * logits_non_reg
+        
+        # Convert to numpy immediately to free GPU memory
+        combined_prob_np = combined_prob.cpu().detach().numpy()
+        true_labels_np = labels.cpu().numpy()
+        
+        # Store the predictions and labels
+        combined_predictions.append(combined_prob_np)
+        true_labels.append(true_labels_np)
+        
+        # Free remaining tensors - do a single cleanup at the end of batch processing
+        del var_estimate, f_vr, kappa, combined_prob, inputs, labels, logits_non_reg, output_non_reg
+        
+        # Only clear cache at the end of batch processing
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    # Flatten the lists at the end of processing all batches
+    combined_predictions = np.concatenate(combined_predictions, axis=0)
+    true_labels = np.concatenate(true_labels, axis=0)
+    log.info(f"Completed sketching predictions. Shape: {combined_predictions.shape}")
+    
     return combined_predictions, true_labels
 
 

@@ -1,0 +1,61 @@
+defaults:
+  - override hydra/launcher: joblib
+
+hydra:
+  launcher:
+    n_jobs: 1
+
+model:
+  name: 'EleutherAI/gpt-neo-125M' # 'EleutherAI/gpt-neo-125M' | 'EleutherAI/gpt-neo-1.3B'
+  output_dir: './model_output_trial'
+  token_padding: 'eos'
+  learning_rate: 2e-5
+  train_batch_size: 4
+  eval_batch_size: 4
+  gradient_accumulation_steps: 4
+  epochs: 1
+  weight_decay: 0.01
+  save_strategy: 'epoch'
+  load_best_model_at_end: false # requires evaluation_strategy
+  fp16: true
+  var_method: hfl_oracle
+  dropout_rate: 0.1 # hyperparameter for var_method = dropout
+  hfl_lambda: 0.1  # hyperparameter for var_method = hfl
+  n_ensemble_heads: 10
+  sketching_multiplier: 0.01 # hyperparameter for var_method = hfl_oracle
+  u_seed_init: 1
+  right_sketch_size: 4
+
+
+stg:
+  target_dataset_name: wikitext
+  force_process_dat: false
+  dat_version: 103small #tiny #small #tiny
+  dat_save_template: '/path/to/saved/folder/{dataset_name}-{dataset_version}_{{split}}'
+  target_dat_size: 35000
+
+datasets:
+  - name: 'wikitext'
+    version: 'wikitext-103-raw-v1'
+    sample_fraction: 0.01
+  - name: 'imdb'
+    pool_and_split: true # pool all splits then randomly split into train / test / validation
+    sample_fraction: 0.25
+
+evaluate:
+  method: hfl # map | hfl | dropout | laplace \ ensemble
+  split: test
+  dropout_rate: 0.0001
+  dropout_n_samples: 20
+  laplace_method: diag # full | diag
+  laplace_weight_prior: 0.1
+  var_scalings:
+    - 0.01
+  f_model_path: /path/to/fine/tuned/model # common to all methods
+  hfl_model_path: /path/to/fine/tuned/regularized/model # special to RegVar
+  subsample_test_frac: 1.0
+  subsample_test_seed: 0
+  laplace_cov_template: 'laplace_cov_{laplace_method}_{dataset_name}-{dataset_version}_{model_name}_validation'
+  save_laplace_cov_path: null
+  load_laplace_cov_path: /root/projects/trf/hfl/models
+  hfl_lambda_path: null # defined relative to hfl_model_path

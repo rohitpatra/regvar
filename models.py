@@ -41,6 +41,35 @@ class HFLTrainer(Trainer):
         total_loss = loss + additional_loss
         return (total_loss, outputs) if return_outputs else total_loss
 
+class HFLOracleTrainer(Trainer):
+    def __init__(self, model, args, train_dataset, eval_dataset, tokenizer, lam=0.1, u_eval=None, **kwargs):
+        super().__init__(model, args, train_dataset=train_dataset, eval_dataset=eval_dataset, **kwargs)
+        self.tokenizer = tokenizer
+        self.lam = lam
+        self.u_eval = u_eval
+        # assert u_eval is a dictionary with the same keys as the model parameters and same shape
+        u_param_names = set(name for name, _ in model.named_parameters())
+        assert set(u_eval.keys()) == u_param_names
+        for name, param in model.named_parameters():
+            assert u_eval[name].shape == param.shape
+        
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        outputs = model(**inputs)
+        logits = outputs.logits
+        labels = inputs['labels']
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))        
+
+        # Compute dot product with model parameters (theta' u)
+        dot_product = 0 
+        for name, param in model.named_parameters():
+            dot_product += (param * self.u_eval[name]).sum()
+        additional_loss = self.lam * dot_product
+
+        # Total loss is the sum of the standard loss and the additional term
+        total_loss = loss + additional_loss
+        return (total_loss, outputs) if return_outputs else total_loss
+
 
 class EnsembleTrainer(Trainer):
     def save_model(self, output_dir=None, _internal_call=False):
@@ -363,6 +392,49 @@ def setup_model_and_trainer(cfg, datasets, tokenizer):
             eval_dataset=datasets['validation'],
             tokenizer=tokenizer,
             lam=model_config.hfl_lambda,
+            compute_metrics=compute_metrics
+        )
+    elif model_config.var_method == 'hfl_oracle':
+        # Set random seed for reproducibility of u_eval generation - use a separate seed from training
+        u_seed = model_config.u_seed_init 
+        log.info(f"Setting torch seed to {u_seed} for reproducible u_eval generation")
+        torch.manual_seed(u_seed)
+        
+        # Calculate total number of trainable parameters
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        log.info(f"Total trainable parameters: {total_params}")
+
+        # Calculate desired standard deviation for variance = 1 / total_params
+        if total_params > 0:
+            target_std_dev = (1.0 / total_params)**0.5
+            log.info(f"Initial target standard deviation for u_eval generation: {target_std_dev}")
+        else:
+            target_std_dev = 1.0 # Avoid division by zero, fallback to std dev 1
+            log.warning("Model has no trainable parameters. Using std dev 1 for u_eval.")
+        
+        # Apply sketching_multiplier if provided
+        sketching_multiplier = model_config.sketching_multiplier
+        if sketching_multiplier is not None:
+            target_std_dev *= sketching_multiplier
+            log.info(f"Applied sketching_multiplier {sketching_multiplier}, adjusted target_std_dev: {target_std_dev}")
+
+        # Generate random noise vector u_eval for each parameter with same shape
+        u_eval = {}
+        for name, param in model.named_parameters():
+            # Generate standard normal noise and scale it by the target standard deviation
+            u_eval[name] = (torch.randn_like(param) * target_std_dev).to(device)
+            
+        # Reset random seed to avoid affecting other random operations
+        torch.manual_seed(torch.initial_seed())
+        
+        trainer = HFLOracleTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=datasets['train'],
+            eval_dataset=datasets['validation'],
+            tokenizer=tokenizer,
+            lam=model_config.hfl_lambda,
+            u_eval=u_eval,
             compute_metrics=compute_metrics
         )
     elif model_config.var_method == 'ensemble':
